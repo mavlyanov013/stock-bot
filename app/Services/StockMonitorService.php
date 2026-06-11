@@ -39,14 +39,16 @@ class StockMonitorService
                     'last_checked_at' => now(),
                 ]);
 
-                $this->telegram->sendMessage($this->formatPriceAlert(
-                    $stock,
-                    $newPrice,
-                    $lastPrice,
-                    $change,
-                    $pct,
-                    $quote['quantity'],
-                ));
+                if ($quote['quantity'] > 0 && $newPrice > 100) {
+                    $this->telegram->sendMessage($this->formatPriceAlert(
+                        $stock,
+                        $newPrice,
+                        $lastPrice,
+                        $change,
+                        $pct,
+                        $quote['quantity'],
+                    ));
+                }
             } elseif ($lastPrice === null) {
                 $stock->update([
                     'last_price' => $newPrice,
@@ -76,8 +78,8 @@ class StockMonitorService
 
             $this->telegram->sendMessage(
                 "📊 <b>UZSE Market Index</b>\n".
-                "Index: <b>".number_format($newIndex, 2)."</b>\n".
-                "Change: <b>{$sign}".number_format($change, 2)."</b>"
+                "Index: <b>".number_format($newIndex, 2, '.', '.')."</b>\n".
+                "Change: <b>{$sign}".number_format($change, 2, '.', '.')."</b>"
             );
         }
 
@@ -92,16 +94,26 @@ class StockMonitorService
         float $pct,
         int $quantity,
     ): string {
-        $sign = $change >= 0 ? '+' : '';
-        $changeEmoji = $change >= 0 ? '📈' : '📉';
-        $time = now()->format('d.m.Y H:i');
+        $isUp = $change >= 0;
+        $time = now()->setTimezone('Asia/Tashkent')->format('d.m.Y H:i');
 
-        return "📊 <b>{$stock->symbol}</b> — O'zgarish!\n".
-            "🏢 Kompaniya: {$stock->company_name}\n".
-            '💰 Narx: <b>'.number_format($newPrice, 2)." so'm</b>\n".
-            "📉 Oldingi narx: ".number_format($lastPrice, 2)." so'm\n".
-            "{$changeEmoji} O'zgarish: {$sign}".number_format($change, 2)." so'm ({$sign}".number_format($pct, 2)."%)\n".
-            '📦 Miqdor: '.number_format($quantity)." ta\n".
-            "🕐 Vaqt: {$time}";
+        return "📊 <b>{$stock->symbol}</b>\n".
+            "🏢 {$stock->company_name}\n".
+            "💰 <b>{$this->formatPrice($newPrice)} so'm</b> ".$this->formatPct($pct, $isUp)."\n".
+            "📉 Oldingi: {$this->formatPrice($lastPrice)} so'm\n".
+            "📦 {$this->formatPrice($quantity)} ta · 🕐 {$time}";
+    }
+
+    private function formatPrice(float $value): string
+    {
+        return number_format($value, 0, '.', '.');
+    }
+
+    private function formatPct(float $pct, bool $isUp): string
+    {
+        $emoji = $isUp ? '🟢' : '🔴';
+        $sign = $pct >= 0 ? '+' : '';
+
+        return "({$emoji} {$sign}".number_format($pct, 2, '.', '').'%)';
     }
 }
