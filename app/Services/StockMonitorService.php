@@ -64,6 +64,23 @@ class StockMonitorService
         $this->checkIndex();
     }
 
+    public function sendTestAlert(): void
+    {
+        $stock = new Stock([
+            'symbol' => 'UZINP',
+            'company_name' => "O'zbekneftegaz AJ",
+        ]);
+
+        $this->telegram->sendMessage($this->formatPriceAlert(
+            $stock,
+            newPrice: 33_600,
+            lastPrice: 32_750,
+            change: 850,
+            pct: 2.59,
+            quantity: 7,
+        ));
+    }
+
     private function checkIndex(): void
     {
         $newIndex = $this->uzse->getIndex();
@@ -166,17 +183,24 @@ class StockMonitorService
 
     private function formatQuantity(int $value): string
     {
-        return $this->formatPrice($value);
+        return number_format($value, 0, '.', '.');
     }
 
     private function formatPrice(float $value): string
     {
-        return number_format($value, 0, '.', '.');
+        return $this->trimDecimals($value / 1000);
     }
 
     private function formatDecimal(float $value): string
     {
-        return number_format($value, 2, '.', '.');
+        return $this->trimDecimals($value);
+    }
+
+    private function trimDecimals(float $value): string
+    {
+        $formatted = rtrim(rtrim(number_format($value, 4, '.', ''), '0'), '.');
+
+        return $formatted === '' ? '0' : $formatted;
     }
 
     private function formatSignedDecimal(float $value): string
@@ -191,6 +215,6 @@ class StockMonitorService
         $emoji = $isUp ? '🟢' : '🔴';
         $sign = $pct >= 0 ? '+' : '−';
 
-        return "({$emoji} {$sign}".number_format(abs($pct), 2, '.', '').'%)';
+        return "({$emoji} {$sign}".$this->trimDecimals(abs($pct)).'%)';
     }
 }
