@@ -112,7 +112,7 @@ class UzseService
             $rows[] = [
                 'symbol' => $symbol,
                 'company_name' => $this->extractCompanyName($cells->eq(3)->text()),
-                'price' => floatval(trim($cells->eq(7)->text())),
+                'price' => floatval(trim($cells->eq(7)->text())) * 1000,
                 'quantity' => $this->parseQuantity($cells->eq(8)->text()),
                 'volume' => $this->parseVolume($cells->eq(9)->text()),
             ];
