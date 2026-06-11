@@ -25,13 +25,35 @@ class UzseService
 
     public function getPrices(): array
     {
-        return array_map(fn (array $row) => [
-            'symbol' => $row['symbol'],
-            'price' => $row['price'],
-            'change' => 0.0,
-            'quantity' => $row['quantity'],
-            'volume' => $row['volume'],
-        ], $this->getTradeResultsRows());
+        try {
+            $response = Http::withoutVerifying()
+                ->withHeaders([
+                    'Accept' => 'text/html',
+                    'User-Agent' => 'Mozilla/5.0',
+                ])
+                ->timeout(30)
+                ->get(self::BASE_URL.'/trade_results');
+
+            if ($response->failed()) {
+                Log::error('Failed to fetch UZSE trade results', ['status' => $response->status()]);
+
+                return [];
+            }
+
+            $rows = $this->parseTradeResultsRows(new Crawler($response->body()));
+
+            return array_map(fn (array $row) => [
+                'symbol' => $row['symbol'],
+                'price' => $row['price'],
+                'change' => 0.0,
+                'quantity' => $row['quantity'],
+                'volume' => $row['volume'],
+            ], $rows);
+        } catch (ConnectionException|RequestException|\Throwable $e) {
+            Log::error('Failed to fetch UZSE prices', ['error' => $e->getMessage()]);
+
+            return [];
+        }
     }
 
     public function getIndex(): float
@@ -66,6 +88,11 @@ class UzseService
             return [];
         }
 
+        return $this->parseTradeResultsRows($crawler);
+    }
+
+    private function parseTradeResultsRows(Crawler $crawler): array
+    {
         $rows = [];
         $seen = [];
 
