@@ -9,6 +9,8 @@ class StockMonitorService
 {
     private const INDEX_CACHE_KEY = 'uzse:last_index';
 
+    private const TIMEZONE = 'Asia/Tashkent';
+
     public function __construct(
         private UzseService $uzse,
         private TelegramService $telegram,
@@ -74,13 +76,10 @@ class StockMonitorService
 
         if ($previousIndex !== null && abs($newIndex - $previousIndex) > 0.5) {
             $change = $newIndex - $previousIndex;
-            $sign = $change >= 0 ? '+' : '';
+            $isUp = $change >= 0;
+            $pct = $previousIndex != 0 ? ($change / $previousIndex) * 100 : 0;
 
-            $this->telegram->sendMessage(
-                "📊 <b>UZSE Market Index</b>\n".
-                "Index: <b>".number_format($newIndex, 2, '.', '.')."</b>\n".
-                "Change: <b>{$sign}".number_format($change, 2, '.', '.')."</b>"
-            );
+            $this->telegram->sendMessage($this->formatIndexAlert($newIndex, $previousIndex, $change, $pct, $isUp));
         }
 
         Cache::forever(self::INDEX_CACHE_KEY, $newIndex);
@@ -95,13 +94,79 @@ class StockMonitorService
         int $quantity,
     ): string {
         $isUp = $change >= 0;
-        $time = now()->setTimezone('Asia/Tashkent')->format('d.m.Y H:i');
+        $direction = $isUp ? "Ko'tarildi" : 'Tushdi';
+        $time = $this->formatTime();
 
-        return "📊 <b>{$stock->symbol}</b>\n".
-            "🏢 {$stock->company_name}\n".
-            "💰 <b>{$this->formatPrice($newPrice)} so'm</b> ".$this->formatPct($pct, $isUp)."\n".
-            "📉 Oldingi: {$this->formatPrice($lastPrice)} so'm\n".
-            "📦 {$this->formatPrice($quantity)} ta · 🕐 {$time}";
+        return implode("\n", [
+            "<b>📊 {$stock->symbol}</b>  ·  <i>{$direction}</i>",
+            '',
+            '🏢 <b>Kompaniya</b>',
+            $stock->company_name,
+            '',
+            '─────────────────',
+            '💰 <b>Joriy narx</b>',
+            "<b>{$this->formatMoney($newPrice)}</b>  {$this->formatPct($pct, $isUp)}",
+            '',
+            '📉 <b>Oldingi narx</b>',
+            $this->formatMoney($lastPrice),
+            '',
+            ($isUp ? '📈' : '📉').' <b>Narx farqi</b>',
+            $this->formatSignedMoney($change),
+            '─────────────────',
+            '',
+            '📦 <b>Savdo miqdori:</b>  '.$this->formatQuantity($quantity).' ta',
+            "🕐 <b>Vaqt:</b>  {$time}  (Toshkent)",
+        ]);
+    }
+
+    private function formatIndexAlert(
+        float $newIndex,
+        float $previousIndex,
+        float $change,
+        float $pct,
+        bool $isUp,
+    ): string {
+        $direction = $isUp ? "Ko'tarildi" : 'Tushdi';
+        $time = $this->formatTime();
+
+        return implode("\n", [
+            '<b>📊 UZSE bozor indeksi</b>  ·  <i>'.$direction.'</i>',
+            '',
+            '─────────────────',
+            '📈 <b>Joriy indeks</b>',
+            '<b>'.$this->formatDecimal($newIndex).'</b>  '.$this->formatPct($pct, $isUp),
+            '',
+            '📉 <b>Oldingi indeks</b>',
+            $this->formatDecimal($previousIndex),
+            '',
+            ($isUp ? '📈' : '📉').' <b>Indeks farqi</b>',
+            $this->formatSignedDecimal($change),
+            '─────────────────',
+            '',
+            "🕐 <b>Vaqt:</b>  {$time}  (Toshkent)",
+        ]);
+    }
+
+    private function formatTime(): string
+    {
+        return now()->setTimezone(self::TIMEZONE)->format('d.m.Y, H:i');
+    }
+
+    private function formatMoney(float $value): string
+    {
+        return $this->formatPrice($value)." so'm";
+    }
+
+    private function formatSignedMoney(float $value): string
+    {
+        $sign = $value >= 0 ? '+' : '−';
+
+        return $sign.$this->formatPrice(abs($value))." so'm";
+    }
+
+    private function formatQuantity(int $value): string
+    {
+        return $this->formatPrice($value);
     }
 
     private function formatPrice(float $value): string
@@ -109,11 +174,23 @@ class StockMonitorService
         return number_format($value, 0, '.', '.');
     }
 
+    private function formatDecimal(float $value): string
+    {
+        return number_format($value, 2, '.', '.');
+    }
+
+    private function formatSignedDecimal(float $value): string
+    {
+        $sign = $value >= 0 ? '+' : '−';
+
+        return $sign.$this->formatDecimal(abs($value));
+    }
+
     private function formatPct(float $pct, bool $isUp): string
     {
         $emoji = $isUp ? '🟢' : '🔴';
-        $sign = $pct >= 0 ? '+' : '';
+        $sign = $pct >= 0 ? '+' : '−';
 
-        return "({$emoji} {$sign}".number_format($pct, 2, '.', '').'%)';
+        return "({$emoji} {$sign}".number_format(abs($pct), 2, '.', '').'%)';
     }
 }
