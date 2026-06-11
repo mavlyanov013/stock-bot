@@ -46,7 +46,6 @@ class StockMonitorService
                     $change,
                     $pct,
                     $quote['quantity'],
-                    $quote['volume'],
                 ));
             } elseif ($lastPrice === null) {
                 $stock->update([
@@ -92,15 +91,17 @@ class StockMonitorService
         float $change,
         float $pct,
         int $quantity,
-        float $volume,
     ): string {
         $sign = $change >= 0 ? '+' : '';
-        $arrow = $change >= 0 ? '📈' : '📉';
+        $changeEmoji = $change >= 0 ? '📈' : '📉';
+        $time = now()->format('d.m.Y H:i');
 
-        return "{$arrow} <b>{$stock->symbol}</b> — {$stock->company_name}\n".
-            'Price: <b>'.number_format($newPrice, 2)." UZS</b> (was ".number_format($lastPrice, 2).")\n".
-            "Change: <b>{$sign}".number_format($change, 2)." ({$sign}".number_format($pct, 2)."%)</b>\n".
-            'Quantity: '.number_format($quantity)."\n".
-            'Volume: '.number_format($volume, 2).' UZS';
+        return "📊 <b>{$stock->symbol}</b> — O'zgarish!\n".
+            "🏢 Kompaniya: {$stock->company_name}\n".
+            '💰 Narx: <b>'.number_format($newPrice, 2)." so'm</b>\n".
+            "📉 Oldingi narx: ".number_format($lastPrice, 2)." so'm\n".
+            "{$changeEmoji} O'zgarish: {$sign}".number_format($change, 2)." so'm ({$sign}".number_format($pct, 2)."%)\n".
+            '📦 Miqdor: '.number_format($quantity)." ta\n".
+            "🕐 Vaqt: {$time}";
     }
 }
