@@ -10,7 +10,7 @@ class SyncStocksCommand extends Command
 {
     protected $signature = 'stocks:sync';
 
-    protected $description = 'Sync stock symbols and company names from UZSE trade results';
+    protected $description = 'Sync stock symbols, ISIN and company names from UZSE';
 
     public function handle(UzseService $uzse): int
     {
@@ -24,10 +24,13 @@ class SyncStocksCommand extends Command
 
         $count = 0;
 
-        foreach ($securities as $symbol => $companyName) {
+        foreach ($securities as $security) {
             Stock::updateOrCreate(
-                ['symbol' => $symbol],
-                ['company_name' => $companyName],
+                ['symbol' => $security['symbol']],
+                [
+                    'isin' => $security['isin'],
+                    'company_name' => $security['company_name'],
+                ],
             );
             $count++;
         }

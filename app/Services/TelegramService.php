@@ -18,11 +18,13 @@ class TelegramService
             return;
         }
 
-        $response = Http::post("https://api.telegram.org/bot{$token}/sendMessage", [
-            'chat_id' => $chatId,
-            'text' => $html,
-            'parse_mode' => 'HTML',
-        ]);
+        $response = Http::withoutVerifying()
+            ->timeout(15)
+            ->post("https://api.telegram.org/bot{$token}/sendMessage", [
+                'chat_id' => $chatId,
+                'text' => $html,
+                'parse_mode' => 'HTML',
+            ]);
 
         if ($response->failed()) {
             Log::error('Telegram sendMessage failed', [

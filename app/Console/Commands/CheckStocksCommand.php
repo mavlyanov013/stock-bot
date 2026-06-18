@@ -29,9 +29,10 @@ class CheckStocksCommand extends Command
 
     private function runCheck(StockMonitorService $monitor): void
     {
+        $this->info('START stocks:check');
         $this->info('Checking UZSE stock prices...');
 
-        $monitor->check();
+        $monitor->check($this);
 
         $this->info('Done.');
     }

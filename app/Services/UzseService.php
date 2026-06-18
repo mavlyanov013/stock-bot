@@ -10,47 +10,69 @@ use Symfony\Component\DomCrawler\Crawler;
 
 class UzseService
 {
-    private const BASE_URL = 'https://uzse.uz';
+    private const BASE_URL = 'https://www.uzse.uz';
 
     public function getSecurities(): array
     {
+        try {
+            $response = Http::withoutVerifying()
+                ->withHeaders($this->htmlHeaders())
+                ->timeout(30)
+                ->get(self::BASE_URL.'/isu_infos/names', ['mkt_id' => 'STK']);
+        } catch (ConnectionException|RequestException|\Throwable $e) {
+            Log::error('Failed to fetch UZSE securities list', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+
+        if ($response->failed()) {
+            Log::error('Failed to fetch UZSE securities list', ['status' => $response->status()]);
+
+            return [];
+        }
+
         $securities = [];
 
-        foreach ($this->getTradeResultsRows() as $row) {
-            $securities[$row['symbol']] = $row['company_name'];
+        foreach ($response->json() as $row) {
+            if (! is_array($row) || count($row) < 3) {
+                continue;
+            }
+
+            [$isin, $symbol, $companyName] = $row;
+            $securities[$symbol] = [
+                'isin' => $isin,
+                'symbol' => $symbol,
+                'company_name' => $this->extractCompanyName($companyName),
+            ];
         }
 
         return $securities;
     }
 
-    public function getPrices(): array
+    public function getStockHistory(string $isin): array
     {
         try {
             $response = Http::withoutVerifying()
-                ->withHeaders([
-                    'Accept' => 'text/html',
-                    'User-Agent' => 'Mozilla/5.0',
-                ])
-                ->timeout(30)
-                ->get(self::BASE_URL.'/trade_results');
+                ->withHeaders($this->htmlHeaders())
+                ->timeout(10)
+                ->connectTimeout(5)
+                ->get(self::BASE_URL.'/isu_infos/STK', ['isu_cd' => $isin]);
 
             if ($response->failed()) {
-                Log::error('Failed to fetch UZSE trade results', ['status' => $response->status()]);
+                Log::error('Failed to fetch UZSE stock history', [
+                    'isin' => $isin,
+                    'status' => $response->status(),
+                ]);
 
                 return [];
             }
 
-            $rows = $this->parseTradeResultsRows(new Crawler($response->body()));
-
-            return array_map(fn (array $row) => [
-                'symbol' => $row['symbol'],
-                'price' => $row['price'],
-                'change' => 0.0,
-                'quantity' => $row['quantity'],
-                'volume' => $row['volume'],
-            ], $rows);
+            return $this->parseStockHistory(new Crawler($response->body()));
         } catch (ConnectionException|RequestException|\Throwable $e) {
-            Log::error('Failed to fetch UZSE prices', ['error' => $e->getMessage()]);
+            Log::error('Failed to fetch UZSE stock history', [
+                'isin' => $isin,
+                'error' => $e->getMessage(),
+            ]);
 
             return [];
         }
@@ -61,7 +83,8 @@ class UzseService
         try {
             $response = Http::withoutVerifying()
                 ->withHeaders($this->jsonHeaders())
-                ->timeout(15)
+                ->timeout(10)
+                ->connectTimeout(5)
                 ->get(self::BASE_URL.'/indices');
         } catch (ConnectionException|RequestException $e) {
             Log::error('Failed to fetch UZSE index', ['error' => $e->getMessage()]);
@@ -80,82 +103,192 @@ class UzseService
         return (float) ($data['last_index']['idx'] ?? 0);
     }
 
-    private function getTradeResultsRows(): array
+    private function parseStockHistory(Crawler $crawler): array
     {
-        $crawler = $this->fetchTradeResultsCrawler();
+        $tables = $crawler->filter('table');
 
-        if ($crawler === null) {
+        if ($tables->count() < 5) {
             return [];
         }
 
-        return $this->parseTradeResultsRows($crawler);
-    }
+        $rows = $tables->eq(4)->filter('tr');
+        $latestRow = null;
+        $latestTimestamp = null;
 
-    private function parseTradeResultsRows(Crawler $crawler): array
-    {
-        $rows = [];
-        $seen = [];
-
-        $crawler->filter('table tbody tr')->each(function (Crawler $row) use (&$rows, &$seen) {
+        $rows->each(function (Crawler $row) use (&$latestRow, &$latestTimestamp) {
             $cells = $row->filter('td');
-            if ($cells->count() < 8) {
+
+            if ($cells->count() < 5) {
                 return;
             }
 
-            $symbol = $this->extractSymbol($cells->eq(2)->text());
-            if ($symbol === '' || isset($seen[$symbol])) {
+            $price = $this->parsePrice($cells->eq(1)->text());
+
+            if ($price <= 0) {
                 return;
             }
 
-            $seen[$symbol] = true;
+            $timestamp = $this->parseTradeDate(trim($cells->eq(0)->text()));
 
-            $rows[] = [
-                'symbol' => $symbol,
-                'company_name' => $this->extractCompanyName($cells->eq(3)->text()),
-                'price' => floatval(trim($cells->eq(7)->text())) * 1000,
-                'quantity' => $this->parseQuantity($cells->eq(8)->text()),
-                'volume' => $this->parseVolume($cells->eq(9)->text()),
-            ];
+            if ($timestamp === null) {
+                return;
+            }
+
+            if ($latestTimestamp === null || $timestamp > $latestTimestamp) {
+                $latestTimestamp = $timestamp;
+                $latestRow = $row;
+            }
         });
 
-        return $rows;
+        if ($latestRow === null) {
+            return [];
+        }
+
+        $cells = $latestRow->filter('td');
+
+        return [
+            'date' => trim($cells->eq(0)->text()),
+            'price' => $this->parsePrice($cells->eq(1)->text()),
+            'change' => $this->parseChange($cells->eq(2)),
+            'quantity' => $this->parseQuantity($cells->eq(3)->text()),
+            'volume' => $this->parseVolume($cells->eq(4)->text()),
+        ];
     }
 
-    private function fetchTradeResultsCrawler(): ?Crawler
+    /**
+     * UZSE history table prices are already in full soums (e.g. "6,398" → 6398).
+     */
+    private function parsePrice(string $text): float
     {
-        try {
-            $response = Http::withoutVerifying()
-                ->withHeaders([
-                    'Accept' => 'text/html',
-                    'User-Agent' => 'Mozilla/5.0',
-                ])
-                ->timeout(15)
-                ->get(self::BASE_URL.'/trade_results');
-        } catch (ConnectionException|RequestException $e) {
-            Log::error('Failed to fetch UZSE trade results', ['error' => $e->getMessage()]);
+        return floatval(str_replace(',', '', trim($text)));
+    }
 
+    private function parseTradeDate(string $text): ?int
+    {
+        $text = preg_replace('/\s+/u', ' ', trim($text));
+
+        if ($text === '') {
             return null;
         }
 
-        if ($response->failed()) {
-            Log::error('Failed to fetch UZSE trade results', ['status' => $response->status()]);
+        if (preg_match('/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[,\s]+(\d{1,2}):(\d{2}))?/u', $text, $matches)) {
+            return $this->buildTimestamp(
+                (int) $matches[3],
+                (int) $matches[2],
+                (int) $matches[1],
+                isset($matches[4]) ? (int) $matches[4] : 0,
+                isset($matches[5]) ? (int) $matches[5] : 0,
+            );
+        }
 
+        if (preg_match('/^(\d{1,2})\s+([а-яё]+)\s+(\d{4}),?\s*(\d{1,2}):(\d{2})/iu', $text, $matches)) {
+            $month = $this->russianMonthToNumber($matches[2]);
+
+            if ($month === null) {
+                return null;
+            }
+
+            return $this->buildTimestamp(
+                (int) $matches[3],
+                $month,
+                (int) $matches[1],
+                (int) $matches[4],
+                (int) $matches[5],
+            );
+        }
+
+        if (preg_match('/^(\d{1,2})\s+([а-яё]+),?\s*(\d{1,2}):(\d{2})/iu', $text, $matches)) {
+            $month = $this->russianMonthToNumber($matches[2]);
+
+            if ($month === null) {
+                return null;
+            }
+
+            return $this->buildTimestamp(
+                (int) date('Y'),
+                $month,
+                (int) $matches[1],
+                (int) $matches[3],
+                (int) $matches[4],
+            );
+        }
+
+        if (preg_match('/^(\d{1,2})\s+([а-яё]+)\s+(\d{4})$/iu', $text, $matches)) {
+            $month = $this->russianMonthToNumber($matches[2]);
+
+            if ($month === null) {
+                return null;
+            }
+
+            return $this->buildTimestamp((int) $matches[3], $month, (int) $matches[1]);
+        }
+
+        return null;
+    }
+
+    private function buildTimestamp(
+        int $year,
+        int $month,
+        int $day,
+        int $hour = 0,
+        int $minute = 0,
+    ): ?int {
+        if (! checkdate($month, $day, $year)) {
             return null;
         }
 
-        return new Crawler($response->body());
+        return mktime($hour, $minute, 0, $month, $day, $year) ?: null;
     }
 
-    private function extractSymbol(string $text): string
+    private function russianMonthToNumber(string $month): ?int
     {
-        $parts = preg_split('/\s+/', trim($text));
+        $month = mb_strtolower(trim($month));
 
-        return $parts ? (string) end($parts) : '';
+        $prefixes = [
+            'январ' => 1,
+            'феврал' => 2,
+            'март' => 3,
+            'апрел' => 4,
+            'май' => 5,
+            'мая' => 5,
+            'июн' => 6,
+            'июл' => 7,
+            'август' => 8,
+            'сентябр' => 9,
+            'октябр' => 10,
+            'ноябр' => 11,
+            'декабр' => 12,
+        ];
+
+        foreach ($prefixes as $prefix => $number) {
+            if (str_starts_with($month, $prefix)) {
+                return $number;
+            }
+        }
+
+        return null;
+    }
+
+    private function parseChange(Crawler $cell): float
+    {
+        $text = trim($cell->text());
+        $value = floatval(str_replace([',', '▲', '▼', ' '], '', $text));
+        $class = $cell->attr('class') ?? '';
+
+        if (str_contains($class, 'price-down')) {
+            return -abs($value);
+        }
+
+        if (str_contains($class, 'price-up')) {
+            return abs($value);
+        }
+
+        return $value;
     }
 
     private function extractCompanyName(string $text): string
     {
-        return trim(str_replace(['<', '>'], '', $text));
+        return trim(str_replace(['<', '>'], '', html_entity_decode($text)));
     }
 
     private function parseQuantity(string $text): int
@@ -165,9 +298,15 @@ class UzseService
 
     private function parseVolume(string $text): float
     {
-        $cleaned = str_replace(',', '', str_replace('UZS ', '', trim($text)));
+        return floatval(str_replace(',', '', trim($text)));
+    }
 
-        return floatval($cleaned);
+    private function htmlHeaders(): array
+    {
+        return [
+            'Accept' => 'text/html,application/json',
+            'User-Agent' => 'Mozilla/5.0',
+        ];
     }
 
     private function jsonHeaders(): array

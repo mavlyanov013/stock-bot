@@ -3,7 +3,9 @@
 namespace App\Services;
 
 use App\Models\Stock;
+use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 class StockMonitorService
 {
@@ -16,15 +18,48 @@ class StockMonitorService
         private TelegramService $telegram,
     ) {}
 
-    public function check(): void
+    public function check(?Command $command = null): void
     {
         $minChange = (float) config('services.uzse.min_change', 1);
-        $prices = $this->uzse->getPrices();
+        $stocks = Stock::whereNotNull('isin')->get();
 
-        foreach ($prices as $quote) {
-            $stock = Stock::where('symbol', $quote['symbol'])->first();
+        if ($stocks->isEmpty()) {
+            Log::warning('No stocks with ISIN found. Run stocks:sync first.');
+            $command?->warn('No stocks with ISIN found. Run stocks:sync first.');
 
-            if (! $stock) {
+            return;
+        }
+
+        $command?->info("Loaded {$stocks->count()} stocks to check.");
+
+        foreach ($stocks as $stock) {
+            $command?->info("Processing: {$stock->symbol}");
+            logger()->info("Calling UzseService for: {$stock->symbol}", ['isin' => $stock->isin]);
+
+            try {
+                $quote = $this->uzse->getStockHistory($stock->isin);
+            } catch (\Throwable $e) {
+                Log::error('Stock check failed', [
+                    'symbol' => $stock->symbol,
+                    'isin' => $stock->isin,
+                    'error' => $e->getMessage(),
+                ]);
+                $command?->error("Failed {$stock->symbol}: {$e->getMessage()}");
+
+                sleep(2);
+
+                continue;
+            }
+
+            logger()->info("Received response for: {$stock->symbol}", [
+                'has_data' => $quote !== [],
+            ]);
+
+            if ($quote === []) {
+                Log::warning('No history fetched for stock', ['symbol' => $stock->symbol, 'isin' => $stock->isin]);
+                $command?->warn("No history for {$stock->symbol}, skipping.");
+                sleep(2);
+
                 continue;
             }
 
@@ -41,17 +76,36 @@ class StockMonitorService
                     'last_checked_at' => now(),
                 ]);
 
-                if ($quote['quantity'] > 0 && $newPrice > 100) {
-                    $this->telegram->sendMessage($this->formatPriceAlert(
-                        $stock,
-                        $newPrice,
-                        $lastPrice,
-                        $change,
-                        $pct,
-                        $quote['quantity'],
-                    ));
+                if ($this->isValidTrade($quote)) {
+                    try {
+                        $this->telegram->sendMessage($this->formatPriceAlert(
+                            $stock,
+                            $newPrice,
+                            $lastPrice,
+                            $change,
+                            $pct,
+                            $quote['quantity'],
+                            $quote['date'] ?? null,
+                        ));
+                    } catch (\Throwable $e) {
+                        Log::error('Telegram alert failed', [
+                            'symbol' => $stock->symbol,
+                            'error' => $e->getMessage(),
+                        ]);
+                        $command?->error("Telegram alert failed for {$stock->symbol}: {$e->getMessage()}");
+                    }
                 }
             } elseif ($lastPrice === null) {
+                $stock->update([
+                    'last_price' => $newPrice,
+                    'last_checked_at' => now(),
+                ]);
+            } elseif ($this->isBaselineCorrection($lastPrice, $newPrice)) {
+                Log::info('Correcting baseline price after parse fix', [
+                    'symbol' => $stock->symbol,
+                    'old' => $lastPrice,
+                    'new' => $newPrice,
+                ]);
                 $stock->update([
                     'last_price' => $newPrice,
                     'last_checked_at' => now(),
@@ -59,6 +113,8 @@ class StockMonitorService
             } else {
                 $stock->update(['last_checked_at' => now()]);
             }
+
+            sleep(2);
         }
 
         $this->checkIndex();
@@ -68,17 +124,37 @@ class StockMonitorService
     {
         $stock = new Stock([
             'symbol' => 'UZINP',
-            'company_name' => "O'zbekneftegaz AJ",
+            'company_name' => "O'zbekinvest EISK AJ",
         ]);
 
         $this->telegram->sendMessage($this->formatPriceAlert(
             $stock,
-            newPrice: 33_600,
-            lastPrice: 32_750,
-            change: 850,
-            pct: 2.59,
+            newPrice: 2000,
+            lastPrice: 1950,
+            change: 50,
+            pct: 2.56,
             quantity: 7,
         ));
+    }
+
+    private function isValidTrade(array $quote): bool
+    {
+        return $quote['quantity'] > 0 && $quote['price'] > 100;
+    }
+
+    /**
+     * Detect prices stored with the old broken parser (comma truncated + *1000).
+     * Example: UZTL stored 6000 but real price is 6398.
+     */
+    private function isBaselineCorrection(float $stored, float $actual): bool
+    {
+        if ($stored <= 0 || $actual <= 0) {
+            return false;
+        }
+
+        $ratio = $actual / $stored;
+
+        return $ratio > 1.03 && $ratio < 1.15;
     }
 
     private function checkIndex(): void
@@ -109,20 +185,22 @@ class StockMonitorService
         float $change,
         float $pct,
         int $quantity,
+        ?string $tradeDate = null,
     ): string {
         $isUp = $change >= 0;
         $direction = $isUp ? "Ko'tarildi" : 'Tushdi';
         $time = $this->formatTime();
+        $tradeDay = $tradeDate ? trim(explode(',', $tradeDate)[0]) : null;
 
         return implode("\n", [
             "<b>📊 {$stock->symbol}</b>  ·  <i>{$direction}</i>",
             '',
             '🏢 <b>Kompaniya</b>',
-            $stock->company_name,
+            $this->displayCompanyName($stock),
             '',
             '─────────────────',
             '💰 <b>Joriy narx</b>',
-            "<b>{$this->formatMoney($newPrice)}</b>  {$this->formatPct($pct, $isUp)}",
+            $this->formatMoney($newPrice).'  '.$this->formatPct($pct, $isUp),
             '',
             '📉 <b>Oldingi narx</b>',
             $this->formatMoney($lastPrice),
@@ -132,8 +210,20 @@ class StockMonitorService
             '─────────────────',
             '',
             '📦 <b>Savdo miqdori:</b>  '.$this->formatQuantity($quantity).' ta',
-            "🕐 <b>Vaqt:</b>  {$time}  (Toshkent)",
+            '📅 <b>Savdo kuni:</b>  '.($tradeDay ?? '—'),
+            "🕐 <b>Xabar vaqti:</b>  {$time}  (Toshkent)",
         ]);
+    }
+
+    private function displayCompanyName(Stock $stock): string
+    {
+        $shortNames = [
+            'UZINP' => "O'zbekinvest EISK AJ",
+            'UZTL' => "O'zbektelekom AJ",
+            'UZTLP' => "O'zbektelekom AJ (privilegiyali)",
+        ];
+
+        return $shortNames[$stock->symbol] ?? $stock->company_name;
     }
 
     private function formatIndexAlert(
@@ -151,7 +241,7 @@ class StockMonitorService
             '',
             '─────────────────',
             '📈 <b>Joriy indeks</b>',
-            '<b>'.$this->formatDecimal($newIndex).'</b>  '.$this->formatPct($pct, $isUp),
+            $this->formatDecimal($newIndex).'  '.$this->formatPct($pct, $isUp),
             '',
             '📉 <b>Oldingi indeks</b>',
             $this->formatDecimal($previousIndex),
@@ -183,24 +273,33 @@ class StockMonitorService
 
     private function formatQuantity(int $value): string
     {
-        return number_format($value, 0, '.', '.');
+        return $this->formatPrice($value);
     }
 
     private function formatPrice(float $value): string
     {
-        return $this->trimDecimals($value / 1000);
+        if ($this->isWholeNumber($value)) {
+            return number_format((int) round($value), 0, '.', ' ');
+        }
+
+        $formatted = number_format($value, 2, '.', ' ');
+
+        return rtrim(rtrim($formatted, '0'), '.') ?: '0';
     }
 
     private function formatDecimal(float $value): string
     {
-        return $this->trimDecimals($value);
+        return $this->formatPrice($value);
     }
 
-    private function trimDecimals(float $value): string
+    private function isWholeNumber(float $value): bool
     {
-        $formatted = rtrim(rtrim(number_format($value, 4, '.', ''), '0'), '.');
+        return abs($value - round($value)) < 0.00001;
+    }
 
-        return $formatted === '' ? '0' : $formatted;
+    private function formatWithDecimals(float $value): string
+    {
+        return $this->formatPrice($value);
     }
 
     private function formatSignedDecimal(float $value): string
@@ -215,6 +314,6 @@ class StockMonitorService
         $emoji = $isUp ? '🟢' : '🔴';
         $sign = $pct >= 0 ? '+' : '−';
 
-        return "({$emoji} {$sign}".$this->trimDecimals(abs($pct)).'%)';
+        return "({$emoji} {$sign}".number_format(abs($pct), 2).'%)';
     }
 }

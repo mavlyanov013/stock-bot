@@ -8,6 +8,7 @@ class Stock extends Model
 {
     protected $fillable = [
         'symbol',
+        'isin',
         'company_name',
         'last_price',
         'prev_price',
