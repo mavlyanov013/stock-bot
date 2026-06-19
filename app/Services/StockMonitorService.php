@@ -39,10 +39,9 @@ class StockMonitorService
 
         foreach ($stocks as $stock) {
             $command?->info("Processing: {$stock->symbol}");
-            logger()->info("Calling UzseService for: {$stock->symbol}", ['isin' => $stock->isin]);
 
             try {
-                $quote = $this->uzse->getStockHistory($stock->isin);
+                $history = $this->uzse->getStockHistory($stock->isin);
             } catch (\Throwable $e) {
                 Log::error('Stock check failed', [
                     'symbol' => $stock->symbol,
@@ -56,69 +55,38 @@ class StockMonitorService
                 continue;
             }
 
-            logger()->info("Received response for: {$stock->symbol}", [
-                'has_data' => $quote !== [],
-            ]);
-
-            if ($quote === []) {
-                Log::warning('No history fetched for stock', ['symbol' => $stock->symbol, 'isin' => $stock->isin]);
-                $command?->warn("No history for {$stock->symbol}, skipping.");
+            if (empty($history) || $history['price'] <= 0) {
+                Log::info('No history', ['symbol' => $stock->symbol]);
                 sleep(2);
 
                 continue;
             }
 
-            $newPrice = $quote['price'];
-
-            if ($newPrice <= 0) {
-                Log::warning('Skipping stock with zero price', ['symbol' => $stock->symbol]);
-                sleep(2);
-
-                continue;
-            }
+            Log::info('Got history', ['symbol' => $stock->symbol, 'price' => $history['price']]);
 
             $previousPrice = $stock->last_price;
+            $newPrice = $history['price'];
 
-            $this->updateWeekOpenPrice($stock, $newPrice, $quote);
-
-            $updates = [
-                'last_price' => $newPrice,
-                'last_checked_at' => now(),
-            ];
+            $this->updateWeekOpenPrice($stock, $newPrice, $history);
 
             $priceChanged = $previousPrice !== null
                 && abs($newPrice - $previousPrice) >= $minChange;
 
             if ($priceChanged) {
-                $updates['prev_price'] = $previousPrice;
+                $stock->prev_price = $previousPrice;
             }
 
-            try {
-                Log::info('Attempting save', ['symbol' => $stock->symbol, 'price' => $newPrice]);
+            $stock->last_price = $history['price'];
+            $stock->last_checked_at = now();
+            $saved = $stock->save();
 
-                $result = $stock->update($updates);
-                $stock->refresh();
+            Log::info('Save result', [
+                'symbol' => $stock->symbol,
+                'saved' => $saved,
+                'price' => $stock->last_price,
+            ]);
 
-                Log::info('Saved', [
-                    'symbol' => $stock->symbol,
-                    'price' => $stock->last_price,
-                    'result' => $result,
-                ]);
-            } catch (\Throwable $e) {
-                Log::error('Failed to save stock price', [
-                    'symbol' => $stock->symbol,
-                    'isin' => $stock->isin,
-                    'price' => $newPrice,
-                    'error' => $e->getMessage(),
-                ]);
-                $command?->error("Failed to save {$stock->symbol}: {$e->getMessage()}");
-
-                sleep(2);
-
-                continue;
-            }
-
-            if ($this->shouldSendPriceAlert($quote, $priceChanged)) {
+            if ($this->shouldSendPriceAlert($history, $priceChanged)) {
                 $change = $newPrice - $previousPrice;
                 $pct = $previousPrice != 0 ? ($change / $previousPrice) * 100 : 0;
 
@@ -129,8 +97,8 @@ class StockMonitorService
                         $previousPrice,
                         $change,
                         $pct,
-                        $quote['quantity'],
-                        $quote['date'] ?? null,
+                        $history['quantity'],
+                        $history['date'] ?? null,
                     ));
                 } catch (\Throwable $e) {
                     Log::error('Telegram alert failed', [
