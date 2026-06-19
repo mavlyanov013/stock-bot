@@ -69,6 +69,14 @@ class StockMonitorService
             }
 
             $newPrice = $quote['price'];
+
+            if ($newPrice <= 0) {
+                Log::warning('Skipping stock with zero price', ['symbol' => $stock->symbol]);
+                sleep(2);
+
+                continue;
+            }
+
             $previousPrice = $stock->last_price;
 
             $this->updateWeekOpenPrice($stock, $newPrice, $quote);
@@ -105,9 +113,10 @@ class StockMonitorService
                 'symbol' => $stock->symbol,
                 'last_price' => $newPrice,
                 'previous_price' => $previousPrice,
+                'quantity' => $quote['quantity'],
             ]);
 
-            if ($priceChanged && $this->isValidTrade($quote)) {
+            if ($this->shouldSendPriceAlert($quote, $priceChanged)) {
                 $change = $newPrice - $previousPrice;
                 $pct = $previousPrice != 0 ? ($change / $previousPrice) * 100 : 0;
 
@@ -315,9 +324,11 @@ class StockMonitorService
         ));
     }
 
-    private function isValidTrade(array $quote): bool
+    private function shouldSendPriceAlert(array $quote, bool $priceChanged): bool
     {
-        return $quote['quantity'] > 0 && $quote['price'] > 100;
+        return $priceChanged
+            && $quote['quantity'] > 0
+            && $quote['price'] > 100;
     }
 
     private function checkIndex(): void
