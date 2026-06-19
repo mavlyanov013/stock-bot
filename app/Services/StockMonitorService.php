@@ -4,12 +4,15 @@ namespace App\Services;
 
 use App\Models\Stock;
 use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 class StockMonitorService
 {
     private const INDEX_CACHE_KEY = 'uzse:last_index';
+
+    private const WEEK_START_CACHE_KEY = 'week_start_date';
 
     private const TIMEZONE = 'Asia/Tashkent';
 
@@ -31,6 +34,8 @@ class StockMonitorService
         }
 
         $command?->info("Loaded {$stocks->count()} stocks to check.");
+
+        $this->ensureWeekTracking();
 
         foreach ($stocks as $stock) {
             $command?->info("Processing: {$stock->symbol}");
@@ -65,6 +70,8 @@ class StockMonitorService
 
             $newPrice = $quote['price'];
             $lastPrice = $stock->last_price;
+
+            $this->updateWeekOpenPrice($stock, $newPrice, $quote);
 
             if ($lastPrice !== null && abs($newPrice - $lastPrice) >= $minChange) {
                 $change = $newPrice - $lastPrice;
@@ -118,6 +125,168 @@ class StockMonitorService
         }
 
         $this->checkIndex();
+    }
+
+    public function sendWeeklySummary(?Command $command = null): void
+    {
+        $stocks = Stock::whereNotNull('isin')->get();
+
+        if ($stocks->isEmpty()) {
+            $command?->warn('No stocks found.');
+            Log::warning('Weekly summary skipped: no stocks');
+
+            return;
+        }
+
+        $results = [];
+
+        foreach ($stocks as $stock) {
+            if ($stock->week_open_price === null || $stock->week_open_price <= 0) {
+                continue;
+            }
+
+            try {
+                $quote = $this->uzse->getStockHistory($stock->isin);
+            } catch (\Throwable $e) {
+                Log::warning('Weekly summary: failed to fetch stock', [
+                    'symbol' => $stock->symbol,
+                    'error' => $e->getMessage(),
+                ]);
+
+                continue;
+            }
+
+            if ($quote === [] || $quote['quantity'] <= 0) {
+                continue;
+            }
+
+            $currentPrice = $quote['price'];
+            $weekOpen = $stock->week_open_price;
+            $pct = (($currentPrice - $weekOpen) / $weekOpen) * 100;
+
+            $results[] = [
+                'symbol' => $stock->symbol,
+                'pct' => $pct,
+                'week_open' => $weekOpen,
+                'current' => $currentPrice,
+            ];
+
+            sleep(2);
+        }
+
+        if ($results === []) {
+            $command?->warn('No stocks with weekly data to summarize.');
+            Log::warning('Weekly summary skipped: no qualifying stocks');
+
+            return;
+        }
+
+        usort($results, fn (array $a, array $b) => $b['pct'] <=> $a['pct']);
+
+        $this->telegram->sendMessage($this->formatWeeklySummary($results));
+    }
+
+    private function ensureWeekTracking(): void
+    {
+        $weekStart = now()
+            ->setTimezone(self::TIMEZONE)
+            ->startOfWeek(Carbon::MONDAY)
+            ->format('Y-m-d');
+
+        if (Cache::get(self::WEEK_START_CACHE_KEY) !== $weekStart) {
+            Cache::forever(self::WEEK_START_CACHE_KEY, $weekStart);
+            Stock::query()->update(['week_open_price' => null]);
+        }
+    }
+
+    private function updateWeekOpenPrice(Stock $stock, float $price, array $quote): void
+    {
+        if ($quote === [] || $price <= 0) {
+            return;
+        }
+
+        if ($stock->week_open_price === null) {
+            $stock->update(['week_open_price' => $price]);
+        }
+    }
+
+    private function formatWeeklySummary(array $results): string
+    {
+        $weekStart = Cache::get(self::WEEK_START_CACHE_KEY);
+        $tz = self::TIMEZONE;
+
+        $startDate = $weekStart
+            ? Carbon::parse($weekStart, $tz)->format('d.m.Y')
+            : now()->setTimezone($tz)->startOfWeek(Carbon::MONDAY)->format('d.m.Y');
+
+        $endDate = now()->setTimezone($tz)->format('d.m.Y');
+
+        $gainers = array_filter($results, fn (array $r) => $r['pct'] > 0.005);
+        $losers = array_filter($results, fn (array $r) => $r['pct'] < -0.005);
+        $unchanged = array_filter($results, fn (array $r) => abs($r['pct']) <= 0.005);
+
+        usort($gainers, fn (array $a, array $b) => $b['pct'] <=> $a['pct']);
+        usort($losers, fn (array $a, array $b) => $a['pct'] <=> $b['pct']);
+
+        $lines = [
+            '<b>📊 Haftalik Natijalar</b>',
+            "📅 {$startDate} — {$endDate}",
+            '',
+            '🏆 <b>Ko\'tarilganlar:</b>',
+        ];
+
+        if ($gainers === []) {
+            $lines[] = '—';
+        } else {
+            foreach ($gainers as $row) {
+                $lines[] = $this->formatWeeklySummaryLine($row, '🟢');
+            }
+        }
+
+        $lines[] = '';
+        $lines[] = '📉 <b>Tushganlar:</b>';
+
+        if ($losers === []) {
+            $lines[] = '—';
+        } else {
+            foreach ($losers as $row) {
+                $lines[] = $this->formatWeeklySummaryLine($row, '🔴');
+            }
+        }
+
+        $lines[] = '';
+        $unchangedSymbols = array_map(fn (array $r) => $r['symbol'], array_values($unchanged));
+
+        if ($unchangedSymbols === []) {
+            $lines[] = '➖ <b>O\'zgarmagan:</b> —';
+        } else {
+            $lines[] = '➖ <b>O\'zgarmagan:</b> '.implode(', ', $unchangedSymbols);
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function formatWeeklySummaryLine(array $row, string $emoji): string
+    {
+        $pct = $this->formatSignedWeeklyPct($row['pct']);
+        $open = $this->formatPrice($row['week_open']);
+        $current = $this->formatPrice($row['current']);
+
+        return sprintf(
+            '%s %-5s — %s (%s → %s so\'m)',
+            $emoji,
+            $row['symbol'],
+            $pct,
+            $open,
+            $current,
+        );
+    }
+
+    private function formatSignedWeeklyPct(float $pct): string
+    {
+        $sign = $pct >= 0 ? '+' : '−';
+
+        return $sign.number_format(abs($pct), 2).'%';
     }
 
     public function sendTestAlert(): void

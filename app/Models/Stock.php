@@ -12,6 +12,7 @@ class Stock extends Model
         'company_name',
         'last_price',
         'prev_price',
+        'week_open_price',
         'last_checked_at',
     ];
 
@@ -20,6 +21,7 @@ class Stock extends Model
         return [
             'last_price' => 'float',
             'prev_price' => 'float',
+            'week_open_price' => 'float',
             'last_checked_at' => 'datetime',
         ];
     }

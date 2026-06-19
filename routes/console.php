@@ -9,3 +9,7 @@ Artisan::command('inspire', function () {
 })->purpose('Display an inspiring quote');
 
 Schedule::command('stocks:check')->everyFiveMinutes();
+
+Schedule::command('stocks:weekly-summary')
+    ->weeklyOn(5, '16:05')
+    ->timezone('Asia/Tashkent');
