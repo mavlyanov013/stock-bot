@@ -172,6 +172,10 @@ class StockMonitorService
                 continue;
             }
 
+            if ($history['quantity'] <= 0 || abs($history['change']) < 0.00001) {
+                continue;
+            }
+
             $results[] = [
                 'symbol' => $stock->symbol,
                 'price' => $history['price'],
@@ -185,6 +189,7 @@ class StockMonitorService
             'count' => count($results),
             'target_date' => $targetDate,
             'symbols' => array_column($results, 'symbol'),
+            'filter' => 'quantity > 0 and change != 0',
         ]);
 
         if ($results === []) {
@@ -196,19 +201,28 @@ class StockMonitorService
 
         usort($results, fn (array $a, array $b) => $b['change'] <=> $a['change']);
 
-        $message = $this->formatTodaySummary($results, $targetDate);
+        $messages = $this->buildTodaySummaryMessages($results, $targetDate);
 
-        Log::info('Today summary message ready', ['message' => $message]);
+        Log::info('Today summary messages ready', [
+            'parts' => count($messages),
+            'lengths' => array_map(strlen(...), $messages),
+        ]);
 
-        $command?->info('--- Telegram message ---');
-        $command?->line($message);
-        $command?->info('--- end message ---');
+        foreach ($messages as $index => $message) {
+            $command?->info('--- Telegram message part '.($index + 1).' ---');
+            $command?->line($message);
 
-        Log::info('Calling Telegram sendMessage for today summary');
+            Log::info('Calling Telegram sendMessage for today summary', [
+                'part' => $index + 1,
+                'length' => strlen($message),
+            ]);
 
-        $this->telegram->sendMessage($message);
+            $this->telegram->sendMessage($message);
+        }
 
-        Log::info('Telegram sendMessage completed for today summary');
+        Log::info('Telegram sendMessage completed for today summary', [
+            'parts' => count($messages),
+        ]);
 
         return true;
     }
@@ -247,18 +261,47 @@ class StockMonitorService
         return $this->normalizeHistoryDate($date) === $targetDate;
     }
 
-    private function formatTodaySummary(array $results, string $today): string
+    private function buildTodaySummaryMessages(array $results, string $targetDate): array
     {
-        $lines = [
-            "<b>📊 Bugungi Natijalar — {$today}</b>",
-            '',
-        ];
+        $header = "<b>📊 Bugungi Natijalar — {$targetDate}</b>";
+        $maxLength = 4000;
+        $lines = array_map(
+            fn (array $row) => $this->formatTodaySummaryLine($row['symbol'], $row['price'], $row['change']),
+            $results,
+        );
 
-        foreach ($results as $row) {
-            $lines[] = $this->formatTodaySummaryLine($row['symbol'], $row['price'], $row['change']);
+        $messages = [];
+        $chunkLines = [];
+        $chunkLength = 0;
+        $isFirstChunk = true;
+
+        foreach ($lines as $line) {
+            $prefix = $isFirstChunk ? $header."\n\n" : '';
+            $separator = $chunkLines === [] ? '' : "\n";
+            $addedLength = strlen($separator) + strlen($line);
+
+            if ($chunkLines === [] && $isFirstChunk) {
+                $chunkLength = strlen($prefix) + strlen($line);
+                $chunkLines = [$prefix.$line];
+                continue;
+            }
+
+            if ($chunkLength + $addedLength > $maxLength) {
+                $messages[] = implode("\n", $chunkLines);
+                $chunkLines = [$line];
+                $chunkLength = strlen($line);
+                $isFirstChunk = false;
+            } else {
+                $chunkLines[] = $line;
+                $chunkLength += $addedLength;
+            }
         }
 
-        return implode("\n", $lines);
+        if ($chunkLines !== []) {
+            $messages[] = implode("\n", $chunkLines);
+        }
+
+        return $messages;
     }
 
     private function formatTodaySummaryLine(string $symbol, float $price, float $change): string
