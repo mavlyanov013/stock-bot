@@ -12,6 +12,11 @@ class TelegramService
         $token = config('services.telegram.bot_token');
         $chatId = config('services.telegram.chat_id');
 
+        Log::info('Telegram sendMessage called', [
+            'chat_id' => $chatId,
+            'message_length' => strlen($html),
+        ]);
+
         if (! $token || ! $chatId) {
             Log::warning('Telegram credentials not configured, skipping message.');
 
@@ -30,6 +35,10 @@ class TelegramService
             Log::error('Telegram sendMessage failed', [
                 'status' => $response->status(),
                 'body' => $response->body(),
+            ]);
+        } else {
+            Log::info('Telegram sendMessage succeeded', [
+                'status' => $response->status(),
             ]);
         }
 

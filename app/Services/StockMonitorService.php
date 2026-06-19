@@ -37,7 +37,12 @@ class StockMonitorService
 
         $this->ensureWeekTracking();
 
+        $processed = 0;
+        $savedCount = 0;
+        $alertCount = 0;
+
         foreach ($stocks as $stock) {
+            $processed++;
             $command?->info("Processing: {$stock->symbol}");
 
             try {
@@ -86,6 +91,10 @@ class StockMonitorService
                 'price' => $stock->last_price,
             ]);
 
+            if ($saved) {
+                $savedCount++;
+            }
+
             if ($this->shouldSendPriceAlert($history, $priceChanged)) {
                 $change = $newPrice - $previousPrice;
                 $pct = $previousPrice != 0 ? ($change / $previousPrice) * 100 : 0;
@@ -100,6 +109,7 @@ class StockMonitorService
                         $history['quantity'],
                         $history['date'] ?? null,
                     ));
+                    $alertCount++;
                 } catch (\Throwable $e) {
                     Log::error('Telegram alert failed', [
                         'symbol' => $stock->symbol,
@@ -112,7 +122,159 @@ class StockMonitorService
             sleep(2);
         }
 
+        Log::info('Check complete', [
+            'total' => $processed,
+            'saved' => $savedCount,
+            'alerted' => $alertCount,
+        ]);
+
         $this->checkIndex();
+    }
+
+    public function sendTodaySummary(?Command $command = null, ?string $date = null): bool
+    {
+        $stocks = Stock::whereNotNull('isin')->get();
+        $targetDate = $this->resolveSummaryDate($date);
+        $results = [];
+
+        Log::info('Today summary starting', [
+            'input_date' => $date,
+            'target_date' => $targetDate,
+            'stock_count' => $stocks->count(),
+        ]);
+
+        if ($stocks->isEmpty()) {
+            $command?->warn('No stocks found.');
+            Log::warning('Today summary skipped: no stocks');
+
+            return false;
+        }
+
+        foreach ($stocks as $stock) {
+            try {
+                $history = $this->uzse->getStockHistory($stock->isin);
+            } catch (\Throwable $e) {
+                Log::warning('Today summary: failed to fetch stock', [
+                    'symbol' => $stock->symbol,
+                    'error' => $e->getMessage(),
+                ]);
+
+                continue;
+            }
+
+            if (empty($history) || $history['price'] <= 0) {
+                continue;
+            }
+
+            $historyDate = $this->normalizeHistoryDate($history['date'] ?? '');
+
+            if ($historyDate !== $targetDate) {
+                continue;
+            }
+
+            $results[] = [
+                'symbol' => $stock->symbol,
+                'price' => $history['price'],
+                'change' => $history['change'],
+            ];
+
+            sleep(2);
+        }
+
+        Log::info('Today summary matched stocks', [
+            'count' => count($results),
+            'target_date' => $targetDate,
+            'symbols' => array_column($results, 'symbol'),
+        ]);
+
+        if ($results === []) {
+            $command?->warn("No stocks with trades for {$targetDate}.");
+            Log::warning('Today summary skipped: no stocks for date', ['date' => $targetDate]);
+
+            return false;
+        }
+
+        usort($results, fn (array $a, array $b) => $b['change'] <=> $a['change']);
+
+        $message = $this->formatTodaySummary($results, $targetDate);
+
+        Log::info('Today summary message ready', ['message' => $message]);
+
+        $command?->info('--- Telegram message ---');
+        $command?->line($message);
+        $command?->info('--- end message ---');
+
+        Log::info('Calling Telegram sendMessage for today summary');
+
+        $this->telegram->sendMessage($message);
+
+        Log::info('Telegram sendMessage completed for today summary');
+
+        return true;
+    }
+
+    private function resolveSummaryDate(?string $date): string
+    {
+        if ($date === null || $date === '') {
+            return now()->setTimezone(self::TIMEZONE)->format('d.m.Y');
+        }
+
+        return Carbon::parse($date, self::TIMEZONE)->format('d.m.Y');
+    }
+
+    private function normalizeHistoryDate(string $date): ?string
+    {
+        $date = trim(explode(',', $date)[0]);
+
+        if ($date === '') {
+            return null;
+        }
+
+        if (preg_match('/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/', $date, $matches)) {
+            return sprintf('%02d.%02d.%04d', (int) $matches[1], (int) $matches[2], (int) $matches[3]);
+        }
+
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $date, $matches)) {
+            return Carbon::createFromDate((int) $matches[1], (int) $matches[2], (int) $matches[3])
+                ->format('d.m.Y');
+        }
+
+        return null;
+    }
+
+    private function isHistoryDate(string $date, string $targetDate): bool
+    {
+        return $this->normalizeHistoryDate($date) === $targetDate;
+    }
+
+    private function formatTodaySummary(array $results, string $today): string
+    {
+        $lines = [
+            "<b>📊 Bugungi Natijalar — {$today}</b>",
+            '',
+        ];
+
+        foreach ($results as $row) {
+            $lines[] = $this->formatTodaySummaryLine($row['symbol'], $row['price'], $row['change']);
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function formatTodaySummaryLine(string $symbol, float $price, float $change): string
+    {
+        $isUp = $change >= 0;
+        $emoji = $isUp ? '🟢' : '🔴';
+        $arrow = $isUp ? '▲' : '▼';
+
+        return sprintf(
+            '%s %-5s — %s (%s %s)',
+            $emoji,
+            $symbol,
+            $this->formatMoney($price),
+            $arrow,
+            $this->formatSignedMoney($change),
+        );
     }
 
     public function sendWeeklySummary(?Command $command = null): void
