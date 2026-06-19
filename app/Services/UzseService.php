@@ -51,6 +51,31 @@ class UzseService
 
     public function getStockHistory(string $isin): array
     {
+        $rows = $this->fetchStockHistoryRows($isin);
+
+        if ($rows === []) {
+            return [];
+        }
+
+        return $this->stripHistoryTimestamp($rows[0]);
+    }
+
+    /**
+     * @return list<array{date: string, price: float, change: float, quantity: int, volume: float}>
+     */
+    public function getStockHistoryDays(string $isin): array
+    {
+        return array_map(
+            fn (array $row) => $this->stripHistoryTimestamp($row),
+            $this->fetchStockHistoryRows($isin),
+        );
+    }
+
+    /**
+     * @return list<array{date: string, price: float, change: float, quantity: int, volume: float, timestamp: int}>
+     */
+    private function fetchStockHistoryRows(string $isin): array
+    {
         try {
             $response = Http::withoutVerifying()
                 ->withHeaders($this->htmlHeaders())
@@ -67,7 +92,7 @@ class UzseService
                 return [];
             }
 
-            return $this->parseStockHistory(new Crawler($response->body()));
+            return $this->parseAllStockHistoryRows(new Crawler($response->body()));
         } catch (ConnectionException|RequestException|\Throwable $e) {
             Log::error('Failed to fetch UZSE stock history', [
                 'isin' => $isin,
@@ -76,6 +101,17 @@ class UzseService
 
             return [];
         }
+    }
+
+    /**
+     * @param  array{date: string, price: float, change: float, quantity: int, volume: float, timestamp: int}  $row
+     * @return array{date: string, price: float, change: float, quantity: int, volume: float}
+     */
+    private function stripHistoryTimestamp(array $row): array
+    {
+        unset($row['timestamp']);
+
+        return $row;
     }
 
     public function getIndex(): float
@@ -103,7 +139,7 @@ class UzseService
         return (float) ($data['last_index']['idx'] ?? 0);
     }
 
-    private function parseStockHistory(Crawler $crawler): array
+    private function parseAllStockHistoryRows(Crawler $crawler): array
     {
         $tables = $crawler->filter('table');
 
@@ -111,11 +147,9 @@ class UzseService
             return [];
         }
 
-        $rows = $tables->eq(4)->filter('tr');
-        $latestRow = null;
-        $latestTimestamp = null;
+        $rows = [];
 
-        $rows->each(function (Crawler $row) use (&$latestRow, &$latestTimestamp) {
+        $tables->eq(4)->filter('tr')->each(function (Crawler $row) use (&$rows) {
             $cells = $row->filter('td');
 
             if ($cells->count() < 5) {
@@ -134,25 +168,19 @@ class UzseService
                 return;
             }
 
-            if ($latestTimestamp === null || $timestamp > $latestTimestamp) {
-                $latestTimestamp = $timestamp;
-                $latestRow = $row;
-            }
+            $rows[] = [
+                'date' => trim($cells->eq(0)->text()),
+                'price' => $price,
+                'change' => $this->parseChange($cells->eq(2)),
+                'quantity' => $this->parseQuantity($cells->eq(3)->text()),
+                'volume' => $this->parseVolume($cells->eq(4)->text()),
+                'timestamp' => $timestamp,
+            ];
         });
 
-        if ($latestRow === null) {
-            return [];
-        }
+        usort($rows, fn (array $a, array $b) => $b['timestamp'] <=> $a['timestamp']);
 
-        $cells = $latestRow->filter('td');
-
-        return [
-            'date' => trim($cells->eq(0)->text()),
-            'price' => $this->parsePrice($cells->eq(1)->text()),
-            'change' => $this->parseChange($cells->eq(2)),
-            'quantity' => $this->parseQuantity($cells->eq(3)->text()),
-            'volume' => $this->parseVolume($cells->eq(4)->text()),
-        ];
+        return $rows;
     }
 
     /**

@@ -323,6 +323,14 @@ class StockMonitorService
     public function sendWeeklySummary(?Command $command = null): void
     {
         $stocks = Stock::whereNotNull('isin')->get();
+        $tz = self::TIMEZONE;
+        $weekMonday = now()->setTimezone($tz)->startOfWeek(Carbon::MONDAY)->startOfDay();
+        $weekFriday = $weekMonday->copy()->addDays(4)->startOfDay();
+        $summaryEnd = now()->setTimezone($tz)->startOfDay();
+
+        if ($summaryEnd->gt($weekFriday)) {
+            $summaryEnd = $weekFriday;
+        }
 
         if ($stocks->isEmpty()) {
             $command?->warn('No stocks found.');
@@ -332,14 +340,18 @@ class StockMonitorService
         }
 
         $results = [];
+        $totalVolume = 0.0;
+        $totalDeals = 0;
+
+        Log::info('Weekly summary starting', [
+            'stock_count' => $stocks->count(),
+            'week_start' => $weekMonday->format('d.m.Y'),
+            'week_end' => $summaryEnd->format('d.m.Y'),
+        ]);
 
         foreach ($stocks as $stock) {
-            if ($stock->week_open_price === null || $stock->week_open_price <= 0) {
-                continue;
-            }
-
             try {
-                $quote = $this->uzse->getStockHistory($stock->isin);
+                $historyDays = $this->uzse->getStockHistoryDays($stock->isin);
             } catch (\Throwable $e) {
                 Log::warning('Weekly summary: failed to fetch stock', [
                     'symbol' => $stock->symbol,
@@ -349,11 +361,32 @@ class StockMonitorService
                 continue;
             }
 
-            if ($quote === [] || $quote['quantity'] <= 0) {
+            foreach ($historyDays as $day) {
+                $historyDate = $this->normalizeHistoryDate($day['date'] ?? '');
+
+                if ($historyDate === null || ! $this->isDateWithinWeek($historyDate, $weekMonday, $summaryEnd)) {
+                    continue;
+                }
+
+                $totalVolume += $day['volume'];
+                $totalDeals += $day['quantity'];
+            }
+
+            if ($stock->week_open_price === null || $stock->week_open_price <= 0) {
+                sleep(2);
+
                 continue;
             }
 
-            $currentPrice = $quote['price'];
+            $latestQuote = $historyDays[0] ?? [];
+
+            if ($latestQuote === [] || $latestQuote['quantity'] <= 0) {
+                sleep(2);
+
+                continue;
+            }
+
+            $currentPrice = $latestQuote['price'];
             $weekOpen = $stock->week_open_price;
             $pct = (($currentPrice - $weekOpen) / $weekOpen) * 100;
 
@@ -376,7 +409,26 @@ class StockMonitorService
 
         usort($results, fn (array $a, array $b) => $b['pct'] <=> $a['pct']);
 
-        $this->telegram->sendMessage($this->formatWeeklySummary($results));
+        $message = $this->formatWeeklySummary(
+            $results,
+            $weekMonday->format('d.m.Y'),
+            $summaryEnd->format('d.m.Y'),
+            $totalVolume,
+            $totalDeals,
+        );
+
+        $command?->info('--- Telegram message ---');
+        $command?->line($message);
+        $command?->info('--- end message ---');
+
+        Log::info('Weekly summary message ready', [
+            'length' => strlen($message),
+            'total_volume' => $totalVolume,
+            'total_deals' => $totalDeals,
+            'stock_count' => count($results),
+        ]);
+
+        $this->telegram->sendMessage($message);
     }
 
     private function ensureWeekTracking(): void
@@ -416,60 +468,70 @@ class StockMonitorService
         }
     }
 
-    private function formatWeeklySummary(array $results): string
-    {
-        $weekStart = Cache::get(self::WEEK_START_CACHE_KEY);
-        $tz = self::TIMEZONE;
-
-        $startDate = $weekStart
-            ? Carbon::parse($weekStart, $tz)->format('d.m.Y')
-            : now()->setTimezone($tz)->startOfWeek(Carbon::MONDAY)->format('d.m.Y');
-
-        $endDate = now()->setTimezone($tz)->format('d.m.Y');
-
-        $gainers = array_filter($results, fn (array $r) => $r['pct'] > 0.005);
-        $losers = array_filter($results, fn (array $r) => $r['pct'] < -0.005);
-        $unchanged = array_filter($results, fn (array $r) => abs($r['pct']) <= 0.005);
+    private function formatWeeklySummary(
+        array $results,
+        string $startDate,
+        string $endDate,
+        float $totalVolume,
+        int $totalDeals,
+    ): string {
+        $gainers = array_values(array_filter($results, fn (array $r) => $r['pct'] > 0.005));
+        $losers = array_values(array_filter($results, fn (array $r) => $r['pct'] < -0.005));
+        $unchangedCount = count(array_filter($results, fn (array $r) => abs($r['pct']) <= 0.005));
 
         usort($gainers, fn (array $a, array $b) => $b['pct'] <=> $a['pct']);
         usort($losers, fn (array $a, array $b) => $a['pct'] <=> $b['pct']);
 
+        $topGainers = array_slice($gainers, 0, 5);
+        $topLosers = array_slice($losers, 0, 5);
+        $separator = '━━━━━━━━━━━━━━━━━━━━━';
+
         $lines = [
-            '<b>📊 Haftalik Natijalar</b>',
+            '📊 <b>Haftalik Natijalar</b>',
             "📅 {$startDate} — {$endDate}",
             '',
-            '🏆 <b>Ko\'tarilganlar:</b>',
+            $separator,
+            '🏆 <b>Eng ko\'p o\'sganlar:</b>',
         ];
 
-        if ($gainers === []) {
+        if ($topGainers === []) {
             $lines[] = '—';
         } else {
-            foreach ($gainers as $row) {
+            foreach ($topGainers as $row) {
                 $lines[] = $this->formatWeeklySummaryLine($row, '🟢');
             }
         }
 
         $lines[] = '';
-        $lines[] = '📉 <b>Tushganlar:</b>';
+        $lines[] = '📉 <b>Eng ko\'p tushganlar:</b>';
 
-        if ($losers === []) {
+        if ($topLosers === []) {
             $lines[] = '—';
         } else {
-            foreach ($losers as $row) {
+            foreach ($topLosers as $row) {
                 $lines[] = $this->formatWeeklySummaryLine($row, '🔴');
             }
         }
 
         $lines[] = '';
-        $unchangedSymbols = array_map(fn (array $r) => $r['symbol'], array_values($unchanged));
-
-        if ($unchangedSymbols === []) {
-            $lines[] = '➖ <b>O\'zgarmagan:</b> —';
-        } else {
-            $lines[] = '➖ <b>O\'zgarmagan:</b> '.implode(', ', $unchangedSymbols);
-        }
+        $lines[] = $separator;
+        $lines[] = '💹 <b>Haftalik savdo aylanmasi:</b>';
+        $lines[] = '💰 Jami: '.$this->formatPrice($totalVolume)." so'm";
+        $lines[] = '📦 Jami bitimlar: '.$this->formatQuantity($totalDeals).' ta';
+        $lines[] = '';
+        $lines[] = $separator;
+        $lines[] = '📈 Ko\'tarildi: '.count($gainers).' ta aksiya';
+        $lines[] = '📉 Tushdi: '.count($losers).' ta aksiya';
+        $lines[] = '➖ O\'zgarmadi: '.$unchangedCount.' ta aksiya';
 
         return implode("\n", $lines);
+    }
+
+    private function isDateWithinWeek(string $date, Carbon $weekStart, Carbon $weekEnd): bool
+    {
+        $day = Carbon::createFromFormat('d.m.Y', $date, self::TIMEZONE)->startOfDay();
+
+        return $day->gte($weekStart) && $day->lte($weekEnd);
     }
 
     private function formatWeeklySummaryLine(array $row, string $emoji): string
