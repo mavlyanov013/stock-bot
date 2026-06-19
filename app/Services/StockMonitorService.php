@@ -94,7 +94,16 @@ class StockMonitorService
             }
 
             try {
-                $stock->update($updates);
+                Log::info('Attempting save', ['symbol' => $stock->symbol, 'price' => $newPrice]);
+
+                $result = $stock->update($updates);
+                $stock->refresh();
+
+                Log::info('Saved', [
+                    'symbol' => $stock->symbol,
+                    'price' => $stock->last_price,
+                    'result' => $result,
+                ]);
             } catch (\Throwable $e) {
                 Log::error('Failed to save stock price', [
                     'symbol' => $stock->symbol,
@@ -108,13 +117,6 @@ class StockMonitorService
 
                 continue;
             }
-
-            Log::info('Stock price saved', [
-                'symbol' => $stock->symbol,
-                'last_price' => $newPrice,
-                'previous_price' => $previousPrice,
-                'quantity' => $quote['quantity'],
-            ]);
 
             if ($this->shouldSendPriceAlert($quote, $priceChanged)) {
                 $change = $newPrice - $previousPrice;
@@ -224,7 +226,20 @@ class StockMonitorService
         }
 
         if ($stock->week_open_price === null) {
-            $stock->update(['week_open_price' => $price]);
+            Log::info('Attempting save', [
+                'symbol' => $stock->symbol,
+                'price' => $price,
+                'field' => 'week_open_price',
+            ]);
+
+            $result = $stock->update(['week_open_price' => $price]);
+            $stock->refresh();
+
+            Log::info('Saved', [
+                'symbol' => $stock->symbol,
+                'price' => $stock->week_open_price,
+                'result' => $result,
+            ]);
         }
     }
 
