@@ -69,56 +69,65 @@ class StockMonitorService
             }
 
             $newPrice = $quote['price'];
-            $lastPrice = $stock->last_price;
+            $previousPrice = $stock->last_price;
 
             $this->updateWeekOpenPrice($stock, $newPrice, $quote);
 
-            if ($lastPrice !== null && abs($newPrice - $lastPrice) >= $minChange) {
-                $change = $newPrice - $lastPrice;
-                $pct = $lastPrice != 0 ? ($change / $lastPrice) * 100 : 0;
+            $updates = [
+                'last_price' => $newPrice,
+                'last_checked_at' => now(),
+            ];
 
-                $stock->update([
-                    'prev_price' => $lastPrice,
-                    'last_price' => $newPrice,
-                    'last_checked_at' => now(),
-                ]);
+            $priceChanged = $previousPrice !== null
+                && abs($newPrice - $previousPrice) >= $minChange;
 
-                if ($this->isValidTrade($quote)) {
-                    try {
-                        $this->telegram->sendMessage($this->formatPriceAlert(
-                            $stock,
-                            $newPrice,
-                            $lastPrice,
-                            $change,
-                            $pct,
-                            $quote['quantity'],
-                            $quote['date'] ?? null,
-                        ));
-                    } catch (\Throwable $e) {
-                        Log::error('Telegram alert failed', [
-                            'symbol' => $stock->symbol,
-                            'error' => $e->getMessage(),
-                        ]);
-                        $command?->error("Telegram alert failed for {$stock->symbol}: {$e->getMessage()}");
-                    }
-                }
-            } elseif ($lastPrice === null) {
-                $stock->update([
-                    'last_price' => $newPrice,
-                    'last_checked_at' => now(),
-                ]);
-            } elseif ($this->isBaselineCorrection($lastPrice, $newPrice)) {
-                Log::info('Correcting baseline price after parse fix', [
+            if ($priceChanged) {
+                $updates['prev_price'] = $previousPrice;
+            }
+
+            try {
+                $stock->update($updates);
+            } catch (\Throwable $e) {
+                Log::error('Failed to save stock price', [
                     'symbol' => $stock->symbol,
-                    'old' => $lastPrice,
-                    'new' => $newPrice,
+                    'isin' => $stock->isin,
+                    'price' => $newPrice,
+                    'error' => $e->getMessage(),
                 ]);
-                $stock->update([
-                    'last_price' => $newPrice,
-                    'last_checked_at' => now(),
-                ]);
-            } else {
-                $stock->update(['last_checked_at' => now()]);
+                $command?->error("Failed to save {$stock->symbol}: {$e->getMessage()}");
+
+                sleep(2);
+
+                continue;
+            }
+
+            Log::info('Stock price saved', [
+                'symbol' => $stock->symbol,
+                'last_price' => $newPrice,
+                'previous_price' => $previousPrice,
+            ]);
+
+            if ($priceChanged && $this->isValidTrade($quote)) {
+                $change = $newPrice - $previousPrice;
+                $pct = $previousPrice != 0 ? ($change / $previousPrice) * 100 : 0;
+
+                try {
+                    $this->telegram->sendMessage($this->formatPriceAlert(
+                        $stock,
+                        $newPrice,
+                        $previousPrice,
+                        $change,
+                        $pct,
+                        $quote['quantity'],
+                        $quote['date'] ?? null,
+                    ));
+                } catch (\Throwable $e) {
+                    Log::error('Telegram alert failed', [
+                        'symbol' => $stock->symbol,
+                        'error' => $e->getMessage(),
+                    ]);
+                    $command?->error("Telegram alert failed for {$stock->symbol}: {$e->getMessage()}");
+                }
             }
 
             sleep(2);
@@ -309,21 +318,6 @@ class StockMonitorService
     private function isValidTrade(array $quote): bool
     {
         return $quote['quantity'] > 0 && $quote['price'] > 100;
-    }
-
-    /**
-     * Detect prices stored with the old broken parser (comma truncated + *1000).
-     * Example: UZTL stored 6000 but real price is 6398.
-     */
-    private function isBaselineCorrection(float $stored, float $actual): bool
-    {
-        if ($stored <= 0 || $actual <= 0) {
-            return false;
-        }
-
-        $ratio = $actual / $stored;
-
-        return $ratio > 1.03 && $ratio < 1.15;
     }
 
     private function checkIndex(): void
