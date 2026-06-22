@@ -6,6 +6,7 @@ use App\Models\Stock;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class StockMonitorService
@@ -67,6 +68,28 @@ class StockMonitorService
                 continue;
             }
 
+            if (! empty($history) && $history['price'] > 0) {
+                try {
+                    $affected = DB::table('stocks')
+                        ->where('id', $stock->id)
+                        ->update([
+                            'last_price' => $history['price'],
+                            'last_checked_at' => now(),
+                        ]);
+                    Log::info('DB updated', [
+                        'symbol' => $stock->symbol,
+                        'price' => $history['price'],
+                        'affected' => $affected,
+                    ]);
+
+                    if ($affected > 0) {
+                        $savedCount++;
+                    }
+                } catch (\Exception $e) {
+                    Log::error('DB error', ['symbol' => $stock->symbol, 'error' => $e->getMessage()]);
+                }
+            }
+
             Log::info('Got history', ['symbol' => $stock->symbol, 'price' => $history['price']]);
 
             $previousPrice = $stock->last_price;
@@ -90,10 +113,6 @@ class StockMonitorService
                 'saved' => $saved,
                 'price' => $stock->last_price,
             ]);
-
-            if ($saved) {
-                $savedCount++;
-            }
 
             if ($this->shouldSendPriceAlert($history, $priceChanged)) {
                 $change = $newPrice - $previousPrice;
