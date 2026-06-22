@@ -152,57 +152,23 @@ class StockMonitorService
 
     public function sendTodaySummary(?Command $command = null, ?string $date = null): bool
     {
-        $stocks = Stock::whereNotNull('isin')->get();
         $targetDate = $this->resolveSummaryDate($date);
-        $results = [];
 
         Log::info('Today summary starting', [
             'input_date' => $date,
             'target_date' => $targetDate,
-            'stock_count' => $stocks->count(),
         ]);
 
-        if ($stocks->isEmpty()) {
-            $command?->warn('No stocks found.');
-            Log::warning('Today summary skipped: no stocks');
+        $results = $this->collectDayTradeResults($targetDate, $command);
 
+        if ($results === null) {
             return false;
         }
 
-        foreach ($stocks as $stock) {
-            try {
-                $history = $this->uzse->getStockHistory($stock->isin);
-            } catch (\Throwable $e) {
-                Log::warning('Today summary: failed to fetch stock', [
-                    'symbol' => $stock->symbol,
-                    'error' => $e->getMessage(),
-                ]);
-
-                continue;
-            }
-
-            if (empty($history) || $history['price'] <= 0) {
-                continue;
-            }
-
-            $historyDate = $this->normalizeHistoryDate($history['date'] ?? '');
-
-            if ($historyDate !== $targetDate) {
-                continue;
-            }
-
-            if ($history['quantity'] <= 0 || abs($history['change']) < 0.00001) {
-                continue;
-            }
-
-            $results[] = [
-                'symbol' => $stock->symbol,
-                'price' => $history['price'],
-                'change' => $history['change'],
-            ];
-
-            sleep(2);
-        }
+        $results = array_values(array_filter(
+            $results,
+            fn (array $row) => abs($row['change']) >= 0.00001,
+        ));
 
         Log::info('Today summary matched stocks', [
             'count' => count($results),
@@ -244,6 +210,121 @@ class StockMonitorService
         ]);
 
         return true;
+    }
+
+    public function sendDailySummary(?Command $command = null, ?string $date = null): bool
+    {
+        $targetDate = $this->resolveSummaryDate($date);
+
+        Log::info('Daily summary starting', [
+            'input_date' => $date,
+            'target_date' => $targetDate,
+        ]);
+
+        $results = $this->collectDayTradeResults($targetDate, $command);
+
+        if ($results === null) {
+            return false;
+        }
+
+        Log::info('Daily summary matched stocks', [
+            'count' => count($results),
+            'target_date' => $targetDate,
+            'symbols' => array_column($results, 'symbol'),
+        ]);
+
+        if ($results === []) {
+            $command?->warn("No stocks with trades for {$targetDate}.");
+            Log::warning('Daily summary skipped: no stocks for date', ['date' => $targetDate]);
+
+            return false;
+        }
+
+        $messages = $this->buildDailySummaryMessages($results, $targetDate);
+
+        Log::info('Daily summary messages ready', [
+            'parts' => count($messages),
+            'lengths' => array_map(strlen(...), $messages),
+        ]);
+
+        foreach ($messages as $index => $message) {
+            $command?->info('--- Telegram message part '.($index + 1).' ---');
+            $command?->line($message);
+
+            Log::info('Calling Telegram sendMessage for daily summary', [
+                'part' => $index + 1,
+                'length' => strlen($message),
+            ]);
+
+            $this->telegram->sendMessage($message);
+        }
+
+        Log::info('Telegram sendMessage completed for daily summary', [
+            'parts' => count($messages),
+        ]);
+
+        return true;
+    }
+
+    /**
+     * @return list<array{symbol: string, price: float, change: float, quantity: int, volume: float, pct: float}>|null
+     */
+    private function collectDayTradeResults(string $targetDate, ?Command $command = null): ?array
+    {
+        $stocks = Stock::whereNotNull('isin')->get();
+        $results = [];
+
+        if ($stocks->isEmpty()) {
+            $command?->warn('No stocks found.');
+            Log::warning('Day trade summary skipped: no stocks');
+
+            return null;
+        }
+
+        $command?->info("Loaded {$stocks->count()} stocks to summarize.");
+
+        foreach ($stocks as $stock) {
+            try {
+                $history = $this->uzse->getStockHistory($stock->isin);
+            } catch (\Throwable $e) {
+                Log::warning('Day trade summary: failed to fetch stock', [
+                    'symbol' => $stock->symbol,
+                    'error' => $e->getMessage(),
+                ]);
+
+                continue;
+            }
+
+            if (empty($history) || $history['price'] <= 0) {
+                continue;
+            }
+
+            $historyDate = $this->normalizeHistoryDate($history['date'] ?? '');
+
+            if ($historyDate !== $targetDate) {
+                continue;
+            }
+
+            if ($history['quantity'] <= 0) {
+                continue;
+            }
+
+            $previousPrice = $history['price'] - $history['change'];
+            $pct = $previousPrice > 0 ? ($history['change'] / $previousPrice) * 100 : 0.0;
+
+            $results[] = [
+                'symbol' => $stock->symbol,
+                'price' => $history['price'],
+                'change' => $history['change'],
+                'quantity' => $history['quantity'],
+                'volume' => $history['volume'],
+                'pct' => $pct,
+            ];
+
+            sleep(2);
+        }
+
+        return $results;
     }
 
     private function resolveSummaryDate(?string $date): string
@@ -321,6 +402,120 @@ class StockMonitorService
         }
 
         return $messages;
+    }
+
+    private function buildDailySummaryMessages(array $results, string $targetDate): array
+    {
+        $separator = '━━━━━━━━━━━━━━━━━━━━━';
+        $traded = array_values(array_filter(
+            $results,
+            fn (array $row) => abs($row['change']) >= 0.00001,
+        ));
+        $gainers = array_values(array_filter($traded, fn (array $row) => $row['change'] > 0));
+        $losers = array_values(array_filter($traded, fn (array $row) => $row['change'] < 0));
+
+        usort($gainers, fn (array $a, array $b) => $b['pct'] <=> $a['pct']);
+        usort($losers, fn (array $a, array $b) => $a['pct'] <=> $b['pct']);
+
+        $totalVolume = array_sum(array_column($results, 'volume'));
+        $totalDeals = array_sum(array_column($results, 'quantity'));
+
+        $header = implode("\n", [
+            "📊 <b>Kunlik Natijalar — {$targetDate}</b>",
+            '🕐 Bozor yopildi: 16:00 (Toshkent)',
+            '',
+            '🏆 <b>Ko\'tarilganlar:</b>',
+        ]);
+
+        $bodyLines = $gainers === []
+            ? ['—']
+            : array_map(fn (array $row) => $this->formatDailySummaryLine($row, '🟢'), $gainers);
+
+        $bodyLines[] = '';
+        $bodyLines[] = '📉 <b>Tushganlar:</b>';
+
+        if ($losers === []) {
+            $bodyLines[] = '—';
+        } else {
+            array_push($bodyLines, ...array_map(
+                fn (array $row) => $this->formatDailySummaryLine($row, '🔴'),
+                $losers,
+            ));
+        }
+
+        $footer = implode("\n", [
+            '',
+            $separator,
+            '💹 <b>Kunlik savdo:</b>',
+            '💰 Jami aylanma: '.$this->formatPrice($totalVolume)." so'm",
+            '📦 Jami bitimlar: '.$this->formatQuantity($totalDeals).' ta',
+            '📈 Ko\'tarildi: '.count($gainers).' ta',
+            '📉 Tushdi: '.count($losers).' ta',
+        ]);
+
+        return $this->chunkSummaryMessages($header, $bodyLines, $footer);
+    }
+
+    /**
+     * @param  list<string>  $bodyLines
+     * @return list<string>
+     */
+    private function chunkSummaryMessages(string $header, array $bodyLines, string $footer, int $maxLength = 4000): array
+    {
+        $messages = [];
+        $chunkLines = [];
+        $chunkLength = 0;
+        $isFirstChunk = true;
+        $footerLength = strlen($footer);
+
+        foreach ($bodyLines as $line) {
+            $prefix = $isFirstChunk ? $header."\n" : '';
+            $separator = $chunkLines === [] ? '' : "\n";
+            $addedLength = strlen($separator) + strlen($line);
+            $reserved = ($chunkLines === [] && $isFirstChunk) ? $footerLength : 0;
+
+            if ($chunkLines === [] && $isFirstChunk) {
+                $chunkLength = strlen($prefix) + strlen($line);
+                $chunkLines = [$prefix.$line];
+                continue;
+            }
+
+            if ($chunkLength + $addedLength + $reserved > $maxLength) {
+                $messages[] = implode("\n", $chunkLines);
+                $chunkLines = [$line];
+                $chunkLength = strlen($line);
+                $isFirstChunk = false;
+            } else {
+                $chunkLines[] = $line;
+                $chunkLength += $addedLength;
+            }
+        }
+
+        if ($chunkLines !== []) {
+            $messages[] = implode("\n", $chunkLines).$footer;
+        } elseif ($messages !== []) {
+            $messages[array_key_last($messages)] .= $footer;
+        } else {
+            $messages[] = $header."\n".$footer;
+        }
+
+        return $messages;
+    }
+
+    private function formatDailySummaryLine(array $row, string $emoji): string
+    {
+        $isUp = $row['change'] >= 0;
+        $arrow = $isUp ? '▲' : '▼';
+
+        return sprintf(
+            '%s %-5s — %s (%s %s / %s)',
+            $emoji,
+            $row['symbol'],
+            $this->formatMoney($row['price']),
+            $arrow,
+            $this->formatSignedMoney($row['change']),
+            $this->formatSignedWeeklyPct($row['pct']),
+        );
     }
 
     private function formatTodaySummaryLine(string $symbol, float $price, float $change): string

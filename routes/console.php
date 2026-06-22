@@ -10,6 +10,11 @@ Artisan::command('inspire', function () {
 
 Schedule::command('stocks:check')->everyFiveMinutes();
 
+Schedule::command('stocks:daily-summary')
+    ->weekdays()
+    ->dailyAt('16:05')
+    ->timezone('Asia/Tashkent');
+
 Schedule::command('stocks:weekly-summary')
     ->weeklyOn(5, '16:05')
     ->timezone('Asia/Tashkent');
